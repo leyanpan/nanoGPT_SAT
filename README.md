@@ -1,4 +1,7 @@
 # GPT for SAT Solving
+
+1. We will be using [Wandb](wandb.ai) to track training runs, datasets, and model checkpoints.
+
 ## Update Oct 19 2023
 Create train_sat.py that only computes loss for tokens after the `[SEP]` token and before the padding. This is done by finding the indices of the `[SEP]` and `[PAD\]` tokens in `get_batch()` in train_sat.py and using the indices to extract the tokens and logis of interest in `get_interval_values()` in `utils.py`. However, this training procedure becomes extremely slow for unknown reasons.
 
@@ -26,7 +29,7 @@ python train.py config/train_sat_dpll.py --max_iters 200000
 
 ## CDCL
 
-```bash
+```bashgit
 python train.py config/train_sat_cdcl.py --max_iters 200000
 ```
 

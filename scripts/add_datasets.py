@@ -8,7 +8,7 @@ wandb.init(
 )
 
 # Set the path to the data folder
-data_folder = "./data"
+data_folder = "../data"
 
 # Get the list of all folders inside the data folder
 folders = [folder for folder in os.listdir(data_folder) if os.path.isdir(os.path.join(data_folder, folder))]
