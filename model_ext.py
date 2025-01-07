@@ -33,7 +33,6 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -80,7 +79,6 @@ class CausalSelfAttention(nn.Module):
             y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
         return y
 
 
@@ -91,7 +89,6 @@ class MLP(nn.Module):
         # then project from 4× back to 1×.
         self.c_fc = nn.Linear(config.n_embd, 8 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
 
     def swish(self, x):
         return x * torch.sigmoid(x)
@@ -104,11 +101,10 @@ class MLP(nn.Module):
         a, b = x_fc.split(x_fc.size(-1) // 2, dim=-1)  # each (4*n_embd)
 
         # Step 3: SwiGLU
-        x = nn.SiLU(b)  # shape: (batch, seq_len, 4*n_embd)
+        x = F.silu(b)  # shape: (batch, seq_len, 4*n_embd)
 
         # Step 4: project back to n_embd
         x = self.c_proj(x)     # shape: (batch, seq_len, n_embd)
-        x = self.dropout(x)
 
         return x
 
@@ -222,11 +218,11 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos) 
-            x = self.transformer.drop(tok_emb + pos_emb)
+            x = tok_emb + pos_emb
             position_ids = None
         else:
             tok_emb = self.transformer.wte(idx)
-            x = self.transformer.drop(tok_emb)
+            x = tok_emb
             position_ids = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0).expand(b, t)
 
         # Convert attention_mask (if provided) into a suitable additive mask for attention
