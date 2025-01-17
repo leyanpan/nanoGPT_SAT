@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_lambda=None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -38,48 +38,106 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         self.use_rotary_emb = config.use_rotary_emb
         self.rotary_emb = getattr(config, 'rotary_emb', None)
-
+    
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention.")
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size))
+                      .view(1, 1, config.block_size, config.block_size)
+            )
+    
+        # New options
+        self.relu_attention = getattr(config, 'relu_attention', False)
+        self.log_scale_attention = getattr(config, 'log_scale_attention', False)
+        self.layer_lambda = layer_lambda  # Expected shape: (n_head,) or None
 
-    def forward(self, x, position_ids=None, attn_mask=None):
+    def forward(self, x, position_ids=None, attn_mask=None, layer_lambda=None):
+        """
+        Forward pass for CausalSelfAttention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, T, C).
+            position_ids (torch.Tensor, optional): Position indices of shape (B, T). Defaults to None.
+            attn_mask (torch.Tensor, optional): Attention mask of shape (B, T), with 1 indicating positions to attend to and 0 otherwise. Defaults to None.
+            layer_lambda (torch.Tensor, optional): Tensor of shape (n_head,) for log_scale_attention. Defaults to None.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, T, C).
+        """
         B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
+        # 1. Project x into Q, K, V
+        qkv = self.c_attn(x)  # Shape: (B, T, 3 * C)
+        q, k, v = qkv.split(self.n_embd, dim=2)  # Each of shape: (B, T, C)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, n_head, T, head_dim)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, n_head, T, head_dim)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, n_head, T, head_dim)
+
+        # 2. Apply rotary embeddings if requested
         if self.use_rotary_emb:
             if position_ids is None:
                 position_ids = torch.arange(0, T, dtype=torch.long, device=x.device).unsqueeze(0).expand(B, T)
             cos, sin = self.rotary_emb(q, position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True
-            )
+        # 3. Compute attention scores
+        att_scores = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # Shape: (B, n_head, T, T)
+
+        # 4. Apply log_scale_attention if enabled
+        if self.log_scale_attention and layer_lambda is not None:
+            # layer_lambda: shape (n_head,)
+            # Compute log(i + 1) for positions 0..T-1 to avoid log(0)
+            pos_ids = torch.arange(0, T, device=x.device).float() + 1.0  # Shape: (T,)
+            log_pos = torch.log(pos_ids)  # Shape: (T,)
+            # Expand dimensions to match att_scores: (1, n_head, T, 1)
+            log_pos = log_pos.view(1, 1, T, 1)
+            # Expand layer_lambda to (1, n_head, 1, 1)
+            lamb = layer_lambda.view(1, self.n_head, 1, 1)
+            # Scale attention scores
+            att_scores = att_scores * (1.0 + lamb * log_pos)  # Shape: (B, n_head, T, T)
+
+        # 5. Create causal mask (lower-triangular)
+        causal_mask = torch.tril(torch.ones((T, T), device=x.device)).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, T, T)
+
+        # 6. Combine causal mask with attn_mask
+        if attn_mask is not None:
+            # attn_mask: (B, T) with 1 for attend and 0 for not attend
+            # Expand attn_mask to (B, 1, 1, T)
+            attn_mask_expanded = attn_mask.view(B, 1, 1, T)
+            # Combine masks: only attend to positions where both causal_mask and attn_mask are 1
+            combined_mask = causal_mask * attn_mask_expanded  # Shape: (B, 1, T, T)
         else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            causal_mask = self.bias[:,:,:T,:T]
-            if attn_mask is not None:
-                # Combine causal_mask and attn_mask
-                att = att.masked_fill((causal_mask == 0) | torch.isinf(attn_mask), float('-inf'))
-            else:
-                att = att.masked_fill(causal_mask == 0, float('-inf'))
+            combined_mask = causal_mask  # Shape: (1, 1, T, T)
 
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
+        # 7. Handle relu_attention
+        if self.relu_attention:
+            # Apply ReLU activation
+            att_scores = F.relu(att_scores)  # Shape: (B, n_head, T, T)
+            # Apply combined mask: set positions not to attend to as 0
+            att_scores = att_scores * combined_mask  # Zero out masked positions
+            # Normalize attention weights so that they sum to 1 along the last dimension
+            att_weights = att_scores / (att_scores.sum(dim=-1, keepdim=True) + 1e-9)  # Shape: (B, n_head, T, T)
+        else:
+            # For standard softmax-based attention
+            # Apply mask by adding -1e9 to masked positions
+            # combined_mask: 1 for attend, 0 for not attend
+            att_scores = att_scores.masked_fill(combined_mask == 0, -1e9)  # Shape: (B, n_head, T, T)
+            # Apply softmax
+            att_weights = F.softmax(att_scores, dim=-1)  # Shape: (B, n_head, T, T)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return y
+        # 8. Apply dropout to attention weights
+        att_weights = self.attn_dropout(att_weights)  # Shape: (B, n_head, T, T)
+
+        # 9. Compute attention output
+        att_output = att_weights @ v  # Shape: (B, n_head, T, head_dim)
+
+        # 10. Merge heads and project
+        att_output = att_output.transpose(1, 2).contiguous().view(B, T, C)  # Shape: (B, T, C)
+        att_output = self.c_proj(att_output)  # Shape: (B, T, C)
+
+        return att_output
 
 
 class MLP(nn.Module):
@@ -109,20 +167,14 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None, lambda_params=None):
         super().__init__()
-        # Built-in RMSNorm in PyTorch >= 2.0
-        # Note: By default eps=1e-5, but LLaMA typically uses eps=1e-6
-        # and bias=False (elementwise_affine=True means there's a weight vector, but no bias term).
         self.input_layernorm = nn.RMSNorm(config.n_embd, eps=1e-6, elementwise_affine=True)
-
-        # Your causal self-attention module (which may or may not match LLaMA exactly)
-        self.attn = CausalSelfAttention(config)  
-
-        # Another RMSNorm after attention
+        
+        # Pass layer_lambda to CausalSelfAttention if provided
+        self.attn = CausalSelfAttention(config, layer_lambda=lambda_params)
+    
         self.post_attention_layernorm = nn.RMSNorm(config.n_embd, eps=1e-6, elementwise_affine=True)
-
-        # Your MLP module (SwiGLU or LLaMA’s triple-linear version)
         self.mlp = MLP(config)
 
     def forward(self, x, position_ids=None, attn_mask=None):
@@ -130,6 +182,37 @@ class Block(nn.Module):
         x = x + self.attn(h, position_ids=position_ids, attn_mask=attn_mask)
 
         h2 = self.post_attention_layernorm(x)
+        x = x + self.mlp(h2)
+        return x
+
+class LSTMBlock(nn.Module):
+    """
+    A block that uses LSTM instead of self-attention, but keeps the same MLP afterward.
+    LN -> LSTM -> residual, LN -> MLP -> residual
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        # Instead of ln_1 + CausalSelfAttention, we have ln_1 + LSTM
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.lstm = nn.LSTM(
+            input_size=config.n_embd,
+            hidden_size=config.n_embd,
+            batch_first=True,   # (B, T, C)
+        )
+
+        # The second LN + MLP is the same as in the original Block
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x, position_ids=None, attn_mask=None):
+        # 1) LN -> LSTM -> Residual
+        h = self.ln_1(x)  # (B, T, C)
+        out, _ = self.lstm(h)  # out.shape = (B, T, C) by default
+        x = x + out
+
+        # 2) LN -> MLP -> Residual
+        h2 = self.ln_2(x)
         x = x + self.mlp(h2)
         return x
 
@@ -141,9 +224,15 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    num_lstm_layers: int = 0
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_rotary_emb: bool = False  # NEW: Use rotary embeddings in attention layers
+    relu_attention: bool = False  # NEW: Use ReLU activation in attention scores
+    log_scale_attention: bool = False
+
+    def to_dict(self):
+        return asdict(self)
 
 class GPT(nn.Module):
 
@@ -153,21 +242,41 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # === Embeddings and transformer container ===
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # If not using rotary embeddings, keep wpe
-            wpe = nn.Embedding(config.block_size, config.n_embd) if not config.use_rotary_emb else None,
+            wpe = nn.Embedding(config.block_size, config.n_embd) if config.num_lstm_layers == 0 and not config.use_rotary_emb else None,
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
+        # Initialize lambda parameters for log_scale_attention
+        if getattr(config, 'log_scale_attention', False):
+            # Initialize lambda_params as a learnable parameter of shape (n_layer, n_head)
+            self.lambda_params = nn.Parameter(torch.ones(config.n_layer, config.n_head))
+
+        # Build the stack of blocks (mix of LSTMBlock + Block)
+        blocks = []
+        for i in range(config.n_layer):
+            if i < config.num_lstm_layers:
+                # Use LSTM-based block
+                blocks.append(LSTMBlock(config))
+            else:
+                # Use standard Transformer block, passing layer index and lambda_params if needed
+                blocks.append(Block(
+                    config,
+                    layer_idx=i,
+                    lambda_params=self.lambda_params[i] if getattr(config, 'log_scale_attention', False) else None
+                ))
+
+        self.transformer["h"] = nn.ModuleList(blocks)
+
+        # Final layernorm
+        self.transformer["ln_f"] = LayerNorm(config.n_embd, bias=config.bias)
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # NEW: Initialize rotary embedding if requested
+        # If using rotary embeddings, attach them
         if config.use_rotary_emb:
-            # Here we assume LlamaRotaryEmbedding is defined and works similarly to HF's LLaMA
-            # dimension per head:
             head_dim = config.n_embd // config.n_head
             self.rotary_emb = LlamaRotaryEmbedding(
                 dim=head_dim,
@@ -175,18 +284,20 @@ class GPT(nn.Module):
                 base=10000,
                 scaling_factor=1.0,
                 rope_type="default",
-                config=None  # or pass a mock config if needed
+                config=None
             )
-            # Assign to each attention layer
+            # Assign to each Transformer block that uses self-attn
+            # (LSTMBlocks do not require it, so skip them)
             for block in self.transformer.h:
-                block.attn.rotary_emb = self.rotary_emb
+                if isinstance(block, Block):
+                    block.attn.rotary_emb = self.rotary_emb
 
+        # Weight initialization
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -213,48 +324,36 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        # For rotary embeddings, we don't add position embeddings
-        if not self.config.use_rotary_emb:
-            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-            tok_emb = self.transformer.wte(idx)
-            pos_emb = self.transformer.wpe(pos) 
-            x = tok_emb + pos_emb
+        # If not using rotary, we add position embeddings
+        if self.transformer.wpe is not None:
+            pos = torch.arange(0, t, dtype=torch.long, device=device)  # (t,)
+            tok_emb = self.transformer.wte(idx)        # (B, T, C)
+            pos_emb = self.transformer.wpe(pos)        # (T, C)
+            x = tok_emb + pos_emb.unsqueeze(0)         # broadcast along batch
             position_ids = None
         else:
-            tok_emb = self.transformer.wte(idx)
-            x = tok_emb
+            x = self.transformer.wte(idx)
             position_ids = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0).expand(b, t)
 
-        # Convert attention_mask (if provided) into a suitable additive mask for attention
-        # Attention mask should be of shape [b, t], where 1 means "attend" and 0 means "no attend".
-        if attention_mask is not None:
-            # Use a large negative number instead of -inf
-            mask_value = -1e9
-            attn_mask = (1.0 - attention_mask.view(b, 1, 1, t)) * mask_value
-        else:
-            attn_mask = None
 
+        # Pass through the stack of blocks
         for block in self.transformer.h:
-            x = block(x, position_ids=position_ids, attn_mask=attn_mask)  # pass the mask to each block
+            x = block(x, position_ids=position_ids, attn_mask=attention_mask)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
         if targets is not None:
-            # shift the logits and targets so that position i in logits predicts position i+1 in targets
-            # Note: We slice off the last token in logits and the first token in targets so they align properly
+            # SHIFT logic
             shifted_logits = logits[:, :-1, :].contiguous()
             shifted_targets = targets[:, 1:].contiguous()
-
             loss = F.cross_entropy(
                 shifted_logits.view(-1, shifted_logits.size(-1)),
                 shifted_targets.view(-1),
                 ignore_index=-100
             )
         else:
-            # when targets is None, just return the logits for the last token
-            # this remains the same
-            logits = logits[:, [-1], :]
+            logits = logits[:, [-1], :]  # only return last position
             loss = None
 
         return logits, loss

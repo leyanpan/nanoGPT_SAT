@@ -36,7 +36,10 @@ def create_custom_gpt(args, tokenizer):
         bias=args.bias,
         vocab_size=vocab_size,
         dropout=args.dropout,
+        num_lstm_layers=args.n_lstm,
         use_rotary_emb=args.rope,
+        relu_attention=args.relu_attention,
+        log_scale_attention=args.log_scale_attention,
     )
 
     if args.init_from == 'scratch':
@@ -52,8 +55,7 @@ def create_custom_gpt(args, tokenizer):
         checkpoint = torch.load(ckpt_path, map_location=args.device)
 
         checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            model_args[k] = checkpoint_model_args[k]
+        model_args = checkpoint_model_args
 
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
@@ -186,6 +188,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--block_size', type=int, default=1024)
     parser.add_argument('--n_layer', type=int, default=12)
+    parser.add_argument('--n_lstm', type=int, default=0)
     parser.add_argument('--n_head', type=int, default=12)
     parser.add_argument('--n_embd', type=int, default=768)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -203,6 +206,8 @@ def parse_args():
     parser.add_argument('--dtype', type=str, default=None)
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--relu_attention', action='store_true')
+    parser.add_argument('--log_scale_attention', action='store_true')
 
     # SATDataset args
     parser.add_argument('--max_id', type=int, default=30, help='Maximum constant ID in the dataset')
@@ -409,14 +414,7 @@ def main(args):
                         }
                         # If custom GPT, store model_args to allow resuming
                         if not args.huggingface_llama and hasattr(model, 'config'):
-                            checkpoint['model_args'] = {
-                                'n_layer': model.config.n_layer,
-                                'n_head': model.config.n_head,
-                                'n_embd': model.config.n_embd,
-                                'block_size': model.config.block_size,
-                                'bias': model.config.bias,
-                                'vocab_size': model.config.vocab_size,
-                            }
+                            checkpoint['model_args'] = model.config.to_dict()
 
                         print(f"saving checkpoint to {args.out_dir}")
                         torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))

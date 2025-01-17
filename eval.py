@@ -80,6 +80,7 @@ def load_custom_gpt_model(model_dir, device='cpu'):
 
     # Create GPTConfig from the checkpoint's stored args
     gptconf = GPTConfig(**checkpoint['model_args'])
+    print(f"Loaded model with config: {gptconf}")
     model = GPT(gptconf)
 
     # Remove unwanted prefixes (e.g. _orig_mod.)
